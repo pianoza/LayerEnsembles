@@ -39,6 +39,14 @@ class Activation(nn.Module):
     def forward(self, x):
         return self.activation(x)
 
+class SegmentationHead(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=None, activation=None, upsampling=1):
+        dropout = nn.Dropout(p=dropout, inplace=True) if dropout else nn.Identity()
+        conv2d = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
+        upsampling = nn.UpsamplingBilinear2d(scale_factor=upsampling) if upsampling > 1 else nn.Identity()
+        activation = Activation(activation)
+        super().__init__(dropout, conv2d, upsampling, activation)
+
 class ClassificationHead(nn.Sequential):
     def __init__(self, in_channels, classes, pooling='avg', activation=None, dropout=None):
         if pooling not in ("max", "avg"):
@@ -62,7 +70,7 @@ class LayerEnsembles(nn.Module):
             layer.register_forward_hook(self.save_outputs_hook(layer_id))
         self._layer_ensemble_active = False
 
-    def set_output_heads(self, in_channels: Iterable[int], task: str, classes: int, pooling: str = 'avg', activation: str = None, dropout: float = None):
+    def set_output_heads(self, in_channels: Iterable[int], scale_factors: Iterable[int], task: str, classes: int, pooling: str = 'avg', activation: str = None, dropout: float = None):
         if self._layer_ensemble_active:
             raise ValueError("Output heads should be set only once.")
         self._layer_ensemble_active = True
@@ -77,7 +85,16 @@ class LayerEnsembles(nn.Module):
                 ) for in_channel in in_channels 
             ])
         elif task == Task.SEGMENTATION:
-            raise NotImplementedError
+            self.output_heads = nn.ModuleList([
+                SegmentationHead(
+                    in_channels=in_channel,
+                    out_channels=classes,
+                    kernel_size=3,
+                    dropout=dropout,
+                    activation=activation,
+                    upsampling=scale_factor,
+                ) for in_channel, scale_factor in zip(in_channels, scale_factors)
+            ])
         elif task == Task.REGRESSION:
             raise NotImplementedError
         else:

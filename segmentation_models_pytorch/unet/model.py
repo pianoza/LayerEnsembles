@@ -3,10 +3,10 @@ from typing import Optional, Union, List
 
 from torch.nn.functional import dropout
 from torch.nn import ModuleList
-from .decoder import UnetDecoder, UnetDecoder3D
+from .decoder import UnetDecoder
 from ..encoders import get_encoder
 from ..base import SegmentationModel
-from ..base import SegmentationHead, SegmentationHead3D, ClassificationHead
+from ..base import SegmentationHead, ClassificationHead
 
 
 class Unet(SegmentationModel):
@@ -64,18 +64,15 @@ class Unet(SegmentationModel):
         activation: Optional[Union[str, callable]] = None,
         dropout: Optional[float] = None,
         aux_params: Optional[dict] = None,
-        layer_ensembles: Optional[bool] = True,
     ):
         super().__init__()
-
-        self.layer_ensembles = layer_ensembles
 
         self.encoder = get_encoder(
             encoder_name,
             in_channels=in_channels,
             depth=encoder_depth,
             weights=encoder_weights,
-        )  # <- this now supports resnet18_3d
+        )
 
         self.decoder = UnetDecoder(
             encoder_channels=self.encoder.out_channels,
@@ -84,27 +81,15 @@ class Unet(SegmentationModel):
             use_batchnorm=decoder_use_batchnorm,
             center=True if encoder_name.startswith("vgg") else False,
             attention_type=decoder_attention_type,
-            layer_ensembles=layer_ensembles,
         )
-        if layer_ensembles:
-            self.segmentation_heads = ModuleList([
-                SegmentationHead(
-                    in_channels=in_channels,
-                    out_channels=classes,
-                    dropout=dropout,
-                    activation=activation,
-                    kernel_size=3,
-                    upsampling=upsampling
-                ) for in_channels, upsampling in zip(self.encoder.out_channels[1:]+decoder_channels, (2, 4, 8, 16, 32, 16, 8, 4, 2, 1))
-            ])
-        else:
-            self.segmentation_heads = SegmentationHead(
-                in_channels=decoder_channels[-1],
-                out_channels=classes,
-                dropout=dropout,
-                activation=activation,
-                kernel_size=3,
-            )
+
+        self.segmentation_head = SegmentationHead(
+            in_channels=decoder_channels[-1],
+            out_channels=classes,
+            dropout=dropout,
+            activation=activation,
+            kernel_size=3,
+        )
 
         if aux_params is not None:
             self.classification_head = ClassificationHead(

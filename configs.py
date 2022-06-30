@@ -5,25 +5,13 @@ from utils import Task, Organ
 # CLASSIFICATION LABELS: 1->Malignant; 0->Benign
 RANDOM_SEED = 13
 
-TEST_T = 10
-TASK = Task.CLASSIFICATION
-ORGAN = Organ.BREAST
+SKIP_FIRST_T = 0  # 0 -> no skipping
+TASK = Task.SEGMENTATION  # Task.CLASSIFICATION | Task.REGRESSION | Task.SEGMENTATION
+ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
+IS_LAYER_ENSEMBLES = True
 
-# EXPERIMENT_NAME = 'Inbreast_TB_GRAPH'  # run it once to build and show the network graph in tensorboard
-# EXPERIMENT_NAME = 'BCDR_classification_test'
-# EXPERIMENT_NAME = 'Inbreast_classification_test_full'
-# EXPERIMENT_NAME = 'BCDR_classification_test_full'
-# EXPERIMENT_NAME = 'Inbreast_classification_test_full_cropped_to_breast_TEST'
-# EXPERIMENT_NAME = 'Inbreast_TEST_1'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 times, best model by f1-score
-# EXPERIMENT_NAME = 'Inbreast_TEST_2'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), resized to 256x256, best model by f1-score
-# EXPERIMENT_NAME = 'Inbreast_TEST_3'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), resized to 256x256, best model by f1-score, classification_head(1x(conv+relu+bn)+as usual)
-# EXPERIMENT_NAME = 'Inbreast_TEST_4'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), resized to 256x256, best model by f1-score, classification_head(1x(conv+relu+bn)+as usual+Dropout0.5)
-# EXPERIMENT_NAME = 'Inbreast_TEST_5'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), resized to 256x256, best model by f1-score, classification_head(2x(BasicBlock)+as usual)
-EXPERIMENT_NAME = 'Inbreast_TEST_6'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 times, best model by f1-score, more heads (all .relu)
-# EXPERIMENT_NAME = 'OPTIMAM_TEST_1'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 * 2 times, best model by f1-score, classification_head(2x(BasicBlock)+as usual), 30 epochs, from scratch, lr0.00001
-# EXPERIMENT_NAME = 'OPTIMAM_TEST_2'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 * 2 times, best model by f1-score, classification_head(2x(BasicBlock)+as usual), 100 epochs, from scratch
-# EXPERIMENT_NAME = 'OPTIMAM_TEST_3'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 times, best model by f1-score, classification_head(2x(BasicBlock)+as usual), 100 epochs, from scratch, no lr decay
-# EXPERIMENT_NAME = 'OPTIMAM_TEST_4'  # inside breast area (intensity percentile (0.5, 0.95), min-max normalization), cropped to breast, downsampled 4 times, best model by f1-score, classification_head(2x(BasicBlock)+as usual), 100 epochs, from scratch
+# EXPERIMENT_NAME = 'BCDR_segmentation_test'
+EXPERIMENT_NAME = 'BCDR_LE_segmentation_test'
 print(f'RUNNING EXPERIMENT {EXPERIMENT_NAME}')
 
 # TODO
@@ -63,16 +51,16 @@ LR_DECAY_FACTOR = 0.5
 TENSORBOARD = True
 OVERWRITE = False
 TENSORBOARD_ROOT = SOURCE_CODE_PATH / 'tensorboard'
-PLOT_VALIDATION_FREQUENCY = 1
+PLOT_VALIDATION_FREQUENCY = 10
 RESULTS_PATH = SOURCE_CODE_PATH / 'results'
 
 DROPOUT_RATE = 0.0
-NUM_EPOCHS = 100  # 200
+NUM_EPOCHS = 5  # 200
 EARLY_STOPPING_PATIENCE = 200
 SCHEDULER_PATIENCE = 100  # NOTE same as num epochs, never reduces lr 
 BATCH_SIZE = 5
 VAL_BATCH_SIZE = 2 * BATCH_SIZE
-TEST_BATCH_SIZE = 1  #BATCH_SIZE  # set to 1 because of GradCAM TODO change this to BATCH_SIZE
+TEST_BATCH_SIZE = 2 * BATCH_SIZE  # set to 1 because of GradCAM TODO change this to BATCH_SIZE
 
 # DATASETS
 

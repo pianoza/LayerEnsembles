@@ -404,7 +404,7 @@ class BCDRLoader(Dataset):
             mask[mask > 0] = 1
             sample = tio.Subject(
                 scan = tio.ScalarImage(tensor=torch.from_numpy(image[None, ..., None]).float()),
-                mask = tio.LabelMap(tensor=torch.from_numpy(mask[None, ..., None]).float()),
+                mask = tio.LabelMap(tensor=torch.from_numpy(mask[None, ..., None])),
                 status = self.df.iloc[idx]['status'],
                 patient_id = str(self.df.iloc[idx]['patient_id']),
                 laterality = str(self.df.iloc[idx]['laterality']),

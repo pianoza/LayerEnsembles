@@ -1,0 +1,11 @@
+version: '3.4'
+
+services:
+  layerensembles:
+    image: layerensembles
+    build:
+      context: /home/kaisar/EuCanImage/Coding/LayerEnsembles
+      dockerfile: /home/kaisar/EuCanImage/Coding/LayerEnsembles/Dockerfile
+    command: ["sh", "-c", "pip install debugpy -t /tmp && python /tmp/debugpy --wait-for-client --listen 0.0.0.0:5678 main.py "]
+    ports:
+      - 5678:5678

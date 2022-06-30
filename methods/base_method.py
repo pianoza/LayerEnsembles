@@ -1,4 +1,3 @@
-from enum import Enum
 import scipy
 import warnings 
 from scipy.ndimage.morphology import binary_erosion
@@ -10,21 +9,17 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import auc, average_precision_score, classification_report, precision_recall_curve, roc_curve
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-from sklearn.model_selection import GroupShuffleSplit
 import torchio as tio
-from data.bcdr_loader import BCDRLoader, get_bcdr_subjects
-from data.inbreast_loader import INBreastDataset, get_inbreast_subjects
-from data.optimam_loader import OPTIMAMDatasetLoader, get_optimam_subjects
-from data.mnm_loader import get_mnm_subjects, MnMDataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from utils import ResampleToMask, normalise, make_folders, EarlyStopping, \
-                  show_cam_on_image, Task, Organ, variable_batch_collate
+from utils import normalise, make_folders, EarlyStopping, \
+                  show_cam_on_image, Task, Organ
 from metrics import get_evaluations
-from methods.randconv.randconv_transform import RandConvTransform
 from methods.commons import get_model_for_task, get_criterion_for_task, SingleOutputModel
+from methods.transforms import get_transforms
+from methods.loaders import get_loaders
+from methods.evaluation_utils import get_segmentation_metrics, get_uncertainty_metrics, save_segmentation_images
 
 from pathlib import Path
 from PIL import Image
@@ -42,6 +37,12 @@ class BaseMethod:
         self.layer_ensembles = layer_ensembles
         self.task = configs.TASK
         self.organ = configs.ORGAN
+        if self.organ == Organ.BREAST:
+            self.num_classes = 2
+        elif self.organ == Organ.HEART:
+            self.num_classes = 4
+        else:
+            raise ValueError(f'Organ {self.organ} not supported')
         self.configs = configs
         self.results_path = configs.RESULTS_PATH
         self.experiment_name = configs.EXPERIMENT_NAME
@@ -54,7 +55,8 @@ class BaseMethod:
         self.num_epochs = configs.NUM_EPOCHS
         self.plot_validation_frequency = configs.PLOT_VALIDATION_FREQUENCY
         # Make experiment folders
-        self.best_model_path, self.final_model_path, self.figures_path, self.seg_out_path, self.results_csv_file = self.folders()
+        self.best_model_path, self.final_model_path, self.figures_path, self.metrics_out_path, self.results_csv_file = self.folders()
+        self.target_shape = (1, 1, 256, 256)  # TODO fix this
 
     def run_routine(self, run_test=True):
         # Load data
@@ -65,11 +67,11 @@ class BaseMethod:
             print(f'EXPERIMENT {self.experiment_name} EXISTS!')
             print(f'TESTING ONLY')
             # self.model = self.prepare_model(self.final_model_path)
-            self.model, self.intermediate_layers = self.prepare_model(self.best_model_path)
+            self.model, self.intermediate_layers = self.prepare_model(target_shape=self.target_shape, model_path=self.best_model_path)
         else:
             # If not exists or overwriting, create new model and start training
             # Initialise model, loss, optimiser, scheduler, and early_stopping
-            self.model, self.intermediate_layers = self.prepare_model()
+            self.model, self.intermediate_layers = self.prepare_model(self.target_shape)
             # If tensorboard is enabled, create a new writer
             if self.configs.TENSORBOARD:
                 self.tensorboard()
@@ -82,18 +84,18 @@ class BaseMethod:
 
         if run_test:
             # Run testing
-            self.test(test_loader, T=self.configs.TEST_T)
+            self.test(test_loader)
 
         # Close tensorboard writer
         if self.tb_writer is not None:
             self.tb_writer.close()
     
     def folders(self):
-        models_path, figures_path, seg_out_path = make_folders(self.results_path, self.experiment_name)
+        models_path, figures_path, metrics_out_path = make_folders(self.results_path, self.experiment_name)
         best_model_path = models_path / 'best_model.pt'
         final_model_path = models_path / 'final_model.pt'
         results_csv_file = f'results_{self.experiment_name}.csv'
-        return best_model_path, final_model_path, figures_path, seg_out_path, results_csv_file
+        return best_model_path, final_model_path, figures_path, metrics_out_path, results_csv_file
     
     def tensorboard(self):
         if not self.tboard_exp.is_dir():
@@ -104,151 +106,52 @@ class BaseMethod:
         # # add graph to tensorboard
         # self.tb_writer.add_graph(self.model, torch.rand(1, 1, 256, 256).to(self.configs.DEVICE))
     
-    def prepare_model(self, model_path=None):
-        model, intermediate_layers = get_model_for_task(self.task, self.organ, self.layer_ensembles, encoder_weights=None)
+    def prepare_model(self, target_shape, model_path=None):
+        model, intermediate_layers = get_model_for_task(self.task, self.organ, self.layer_ensembles, target_shape, encoder_weights=None)
         if model_path is not None:
             model.load_state_dict(torch.load(model_path))
         model.to(self.configs.DEVICE)
         return model, intermediate_layers
     
     def prepare_criterion(self):
-        criterion = get_criterion_for_task(self.task)
+        # This could be directly called in self.run_routine() but let's keep it here for now
+        classes = list(range(self.num_classes))
+        criterion = get_criterion_for_task(self.task, classes)
         return criterion
     
     def prepare_optimizer(self, model):
+        # A separate function in case we want to add different optimizers
         return torch.optim.Adam(model.parameters(), lr=self.configs.LR)
     
     def prepare_scheduler(self, optimizer):
+        # A separate function in case we want to add different schedulers
         return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=self.configs.LR_DECAY_FACTOR, patience=self.configs.SCHEDULER_PATIENCE,
                                                           min_lr=self.configs.LR_MIN, verbose=True)
 
     def prepare_early_stopping(self, best_model_path):
+        # A separate function in case we want to add different early stopping strategies
         return EarlyStopping(patience=self.configs.EARLY_STOPPING_PATIENCE, verbose=True, path=best_model_path)
     
     def prepare_transforms(self, target_image_size=256,
                            min_intensity=0, max_intensity=1,
                            min_percentile=0, max_percentile=100,
-                           masking_method=None, is_patches=False):
-        train_transforms = tio.Compose([
-            # Segmentation preprocessing
-            # ResampleToMask(im_size=target_image_size),
-            # tio.CropOrPad((target_image_size, target_image_size, 1), mask_name='mask'), 
-            # Classification preprocessing
-            # tio.Resize((target_image_size, target_image_size, 1)),
-            tio.Resample((4, 4, 1)),  # Downsample by 4, e.g., 1024 -> 256, 2560 -> 640
-            tio.RescaleIntensity(out_min_max=(min_intensity, max_intensity), percentiles=(0.5, 99.5), masking_method='mask'),
-            tio.RandomFlip(axes=(0, 1), p=0.2),
-            # RandConvTransform(kernel_size=(1, 3, 5, 7), mixing=True, identity_prob=0.8),
-            # tio.RandomSwap((10, 10, 1), 10, p=0.2),
-            # tio.ZNormalization(masking_method='mask'),
-            tio.OneHot(num_classes=2),
-        ])
-        test_transforms = tio.Compose([
-            # ResampleToMask(im_size=target_image_size),
-            # tio.CropOrPad((target_image_size, target_image_size, 1), mask_name='mask'), 
-            # tio.Resize((target_image_size, target_image_size, 1)),
-            # Classification preprocessing
-            tio.Resample((4, 4, 1)),  # Downsample by 4, e.g., 1024 -> 256, 2560 -> 640
-            # tio.Resize((target_image_size, target_image_size, 1)),
-            tio.RescaleIntensity(out_min_max=(min_intensity, max_intensity), percentiles=(0.5, 99.5), masking_method='mask'),
-            # tio.ZNormalization(masking_method='mask'),
-            tio.OneHot(num_classes=2),
-            # Uncomment and modify the below code for test time image corruption
-            # tio.Compose([
-            #     # RandConvTransform(kernel_size=(37, 37), mixing=False, identity_prob=0.0),
-            #     # tio.RandomBlur((15, 15, 15, 15, 0, 0), p=1.),
-            #     # tio.RandomNoise((5., 5.001), (.7, .701), p=1.),
-            #     # tio.RandomSwap((20, 20, 1), 10, p=1.),
-            #     # tio.RescaleIntensity((0, 1), (0, 100)),
-            #     # tio.RandomGamma((5.0, 5.1), p=1.)
-            # ], p=1.)
-        ])
+                           perturb_test=False,
+                           ):
+        # This could be called directly in self.run_routine(), but keep it here as it may change in the future
+        train_transforms, test_transforms = get_transforms(self.task, self.num_classes, target_image_size, min_intensity, max_intensity, min_percentile, max_percentile, perturb_test)
         return train_transforms, test_transforms
-    
+
     def loaders(self, dataset, train_transforms, test_transforms, train_val_test_split=(0.60, 0.20, 0.20), batch_size=None, sampler=None):
-        if dataset == 'bcdr':
-            df = get_bcdr_subjects(self.configs.BCDR_PATH, self.configs.BCDR_INFO_CSV, self.configs.BCDR_OUTLINES_CSV, self.configs.TASK)
-            # Print number of unique patient_ids in the data frame
-            print(f'BCDR ---- TOTAL NUMBER OF SAMPLES: {df.shape[0]}')
-            df_train, df_val, df_test = self.unique_group_train_val_test_split(df, train_val_test_split)
-            print(f'SPLITS ---- {df_train.shape[0]} TRAINING, {df_val.shape[0]} VALIDATION, {df_test.shape[0]} TESTING')
-            train_dataset = BCDRLoader(df_train, transform=train_transforms)
-            val_dataset = BCDRLoader(df_val, transform=test_transforms)
-            test_dataset = BCDRLoader(df_test, transform=test_transforms)
-        elif dataset == 'inbreast':
-            df = get_inbreast_subjects(self.configs.INBREAST_INFO_FILE, self.configs.TASK)
-            print(f'INBREAST ---- TOTAL NUMBER OF SAMPLES: {df.shape[0]}')
-            if train_val_test_split[0] == 0. and train_val_test_split[1] == 0:
-                print('ALL SAMPLES FOR TESTING!')
-                test_dataset = INBreastDataset(df, self.configs.INBREAST_IMAGES_DIR, transform=test_transforms)
-                test_loader = DataLoader(test_dataset, batch_size=self.configs.TEST_BATCH_SIZE, shuffle=False, num_workers=self.configs.NUM_WORKERS)
-                return None, None, test_loader
-            df_train, df_val, df_test = self.unique_group_train_val_test_split(df, train_val_test_split)
-            
-            print(f'SPLITS ---- {df_train.shape[0]} TRAINING, {df_val.shape[0]} VALIDATION, {df_test.shape[0]} TESTING')
-            train_dataset = INBreastDataset(df_train, self.configs.INBREAST_IMAGES_DIR, transform=train_transforms)
-            val_dataset = INBreastDataset(df_val, self.configs.INBREAST_IMAGES_DIR, transform=test_transforms)
-            test_dataset = INBreastDataset(df_test, self.configs.INBREAST_IMAGES_DIR, transform=test_transforms)
-        elif dataset == 'optimam':
-            df = get_optimam_subjects(self.configs.OPTIMAM_INFO_FILE)
-            # Print number of unique patient_ids in the data frame
-            print(f'OPTIMAM ---- TOTAL NUMBER OF SAMPLES: {df.shape[0]}')
-            df_train, df_val, df_test = self.unique_group_train_val_test_split(df, train_val_test_split)
-            print(f'SPLITS ---- {df_train.shape[0]} TRAINING, {df_val.shape[0]} VALIDATION, {df_test.shape[0]} TESTING')
-            print(f"TRAINING (NORMAL, MALIGNANT): {df_train[df_train.status == 'Normal'].shape[0]}, {df_train[df_train.status == 'Malignant'].shape[0]}")
-            print(f"VALIDATION (NORMAL, MALIGNANT): {df_val[df_val.status == 'Normal'].shape[0]}, {df_val[df_val.status == 'Malignant'].shape[0]}")
-            print(f"TESTING (NORMAL, MALIGNANT): {df_test[df_test.status == 'Normal'].shape[0]}, {df_test[df_test.status == 'Malignant'].shape[0]}")
-            # Select the same amount of normal as malignant samples for training
-            g = df_train.groupby('status')
-            df_train = g.apply(lambda x: x.sample(g.size().min()).reset_index(drop=True))
-            g = df_val.groupby('status')
-            df_val = g.apply(lambda x: x.sample(g.size().min()).reset_index(drop=True))
-            print(f"TRAINING AFTER BALANCING (NORMAL, MALIGNANT): {df_train[df_train.status == 'Normal'].shape[0]}, {df_train[df_train.status == 'Malignant'].shape[0]}")
-            print(f"VALIDATION AFTER BALANCING (NORMAL, MALIGNANT): {df_val[df_val.status == 'Normal'].shape[0]}, {df_val[df_val.status == 'Malignant'].shape[0]}")
-            train_dataset = OPTIMAMDatasetLoader(df_train, transform=train_transforms)
-            val_dataset = OPTIMAMDatasetLoader(df_val, transform=test_transforms)
-            test_dataset = OPTIMAMDatasetLoader(df_test, transform=test_transforms)
-        elif dataset == 'mnm':
-            # train_subjects = get_mnm_subjects(self.configs, self.configs.MnM_TRAIN_FOLDER, self.configs.MnM_INFO_FILE)
-            # val_subjects = get_mnm_subjects(self.configs, self.configs.MnM_VALIDATION_FOLDER, self.configs.MnM_INFO_FILE)
-            train_loader, val_loader = None, None
-            test_subjects = get_mnm_subjects(self.configs, self.configs.MnM_TEST_FOLDER, self.configs.MnM_INFO_FILE)
-            # print(f'MnM ---- TOTAL NUMBER OF SAMPLES: {len(train_subjects) + len(val_subjects) + len(test_subjects)}')
-            # print(f'SPLITS ---- {len(train_subjects)} TRAINING, {len(val_subjects)} VALIDATION, {len(test_subjects)} TESTING')
-            # train_dataset = tio.SubjectsDataset(train_subjects, transform=train_transforms)
-            # val_dataset = tio.SubjectsDataset(val_subjects, transform=test_transforms)
-            test_dataset = tio.SubjectsDataset(test_subjects, transform=test_transforms)
-            sampler = tio.sampler.UniformSampler((128, 128, 1))
-            # train_loader = MnMDataLoader(train_dataset, batch_size=self.configs.BATCH_SIZE, max_length=2000, samples_per_volume=5, sampler=sampler, shuffle=True, num_workers=self.configs.NUM_WORKERS)
-            # val_loader = MnMDataLoader(val_dataset, batch_size=self.configs.VAL_BATCH_SIZE, max_length=2000, samples_per_volume=5, sampler=sampler, shuffle=False, num_workers=self.configs.NUM_WORKERS)
-            test_loader = MnMDataLoader(test_dataset, batch_size=self.configs.TEST_BATCH_SIZE, max_length=2000, samples_per_volume=10, sampler=sampler, shuffle=False, num_workers=self.configs.NUM_WORKERS)
-            return train_loader, val_loader, test_dataset
-        else:
-            raise ValueError(f'Unknown dataset: {dataset}')
-        train_batch_size = batch_size if batch_size is not None else self.configs.BATCH_SIZE
-
-        if sampler is not None:
-            train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=False, num_workers=self.configs.NUM_WORKERS, sampler=sampler, collate_fn=variable_batch_collate)
-        else: 
-            train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=self.configs.NUM_WORKERS, collate_fn=variable_batch_collate)
-        val_loader = DataLoader(val_dataset, batch_size=self.configs.VAL_BATCH_SIZE, shuffle=False, num_workers=self.configs.NUM_WORKERS, collate_fn=variable_batch_collate)
-        test_loader = DataLoader(test_dataset, batch_size=self.configs.TEST_BATCH_SIZE, shuffle=False, num_workers=self.configs.NUM_WORKERS, collate_fn=variable_batch_collate)
+        # This could be called directly in self.run_routine(), but keep it here as it may change in the future
+        train_loader, val_loader, test_loader = get_loaders(dataset, train_transforms, test_transforms, train_val_test_split, batch_size, sampler)
         return train_loader, val_loader, test_loader
-
-    def unique_group_train_val_test_split(self, df, train_val_test_split):
-        train_inds, test_inds = next(GroupShuffleSplit(test_size=train_val_test_split[2], n_splits=2, random_state=self.configs.RANDOM_SEED).split(df, groups=df['patient_id']))
-        df_tmp = df.iloc[train_inds]
-        df_test = df.iloc[test_inds]
-        train_inds, val_inds = next(GroupShuffleSplit(test_size=train_val_test_split[1], n_splits=2, random_state=self.configs.RANDOM_SEED).split(df_tmp, groups=df_tmp['patient_id']))
-        df_train = df_tmp.iloc[train_inds]
-        df_val = df_tmp.iloc[val_inds]
-        return df_train, df_val, df_test
     
     def train(self, train_loader, val_loader):
         for alpha, epoch in zip(np.linspace(0.01, 0.99, num=self.num_epochs), range(self.num_epochs)):
-            # Train and validate
+            # Train
             train_loss, all_head_losses = self.train_epoch(self.model, train_loader, self.criterion, self.optimizer, alpha)
             print(f'EPOCH {epoch}: All head losses:', all_head_losses)
+            # Validate
             if self.task == Task.SEGMENTATION:
                 val_loss, val_dice = self.validate_epoch(self.model, val_loader, self.criterion, alpha)
             elif self.task == Task.CLASSIFICATION:
@@ -298,9 +201,15 @@ class BaseMethod:
             one_batch = next(iter(val_loader))
             batch_img, batch_label = self.prepare_batch(one_batch, self.device)
             with torch.set_grad_enabled(False):
-                logits = self.forward(self.model, batch_img)
-                batch_seg = logits[-1].argmax(axis=1).unsqueeze(1)
-                batch_label = batch_label.argmax(axis=1).unsqueeze(1)
+                outputs = self.forward(self.model, batch_img)
+                if self.layer_ensembles:
+                    # average over layer ensembles
+                    batch_seg = torch.mean(torch.stack([output for _, output in outputs.items()], dim=0), dim=0)
+                    batch_seg = batch_seg.argmax(dim=1).unsqueeze(1)
+                else:
+                    batch_seg = outputs.argmax(axis=1).unsqueeze(1)
+                # TODO Fix this for multi-class segmentation!!!
+                # batch_label = batch_label.argmax(axis=1).unsqueeze(1)
                 slices = torch.cat((batch_img[:8], batch_seg[:8], batch_label[:8]))
                 batch_plot = make_grid(slices, nrow=8, normalize=True, scale_each=True)
                 self.tb_writer.add_image(f'ImgSegLbl/val_epoch_{epoch+1}', batch_plot, global_step=epoch)
@@ -325,28 +234,27 @@ class BaseMethod:
             logits = model(inputs)
         return logits
 
-    def prepare_batch(self, batch, device, var_size=True):  # TODO - add var_size everywhere else
-        if not var_size:
-            inputs = batch['scan'][tio.DATA].squeeze(-1).to(device)
-        else:
-            # pad to match longest height and width in a batch
-            max_height = max([x.shape[1] for x in batch[0]])
-            max_width = max([x.shape[2] for x in batch[0]])
-            inputs = torch.stack([
-                # The needed padding is the difference between the
-                # max width/height and the image's actual width/height.
-                F.pad(img, [0, 0, 0, max_width - img.size(2), 0, max_height - img.size(1), 0, 0])
-                for img in batch[0]
-            ], dim=0).squeeze(-1).to(device)
+    def prepare_batch(self, batch, device):
+        '''This function always tries to pad the batch samples to the same size.
+        '''
+        # pad to match longest height and width in a batch
+        max_height = max([x.shape[1] for x in batch[0]])
+        max_width = max([x.shape[2] for x in batch[0]])
+        # The needed padding is the difference between the
+        # max width/height and the image's actual width/height.
+        inputs = torch.stack([
+            F.pad(img, [0, 0, 0, max_width - img.size(2), 0, max_height - img.size(1), 0, 0])
+            for img in batch[0]
+        ], dim=0).squeeze(-1).to(device)
 
         if self.task == Task.SEGMENTATION:
-            # TODO account for var_size
-            targets = batch['mask'][tio.DATA].squeeze(-1).to(device)
+            # pad the masks too and hope it will be the same as the input paddings
+            targets = torch.stack([
+                F.pad(img, [0, 0, 0, max_width - img.size(2), 0, max_height - img.size(1), 0, 0])
+                for img in batch[1]
+            ], dim=0).squeeze(-1).to(device)
         elif self.task == Task.CLASSIFICATION:
-            if not var_size:
-                targets = batch['status'].to(device)
-            else:
-                targets = batch[1].to(device)
+            targets = batch[1].to(device)
         else:
             raise ValueError(f'Unknown task: {self.task}')
 
@@ -360,11 +268,15 @@ class BaseMethod:
             data, target = self.prepare_batch(batch, self.device)
             optimizer.zero_grad()
             outputs = model(data)
-            losses = [criterion(output, target) for _, output in outputs.items()]  # DiceLoss and CrossEntropyLoss <- accepts logits
-            total_loss = 0
-            all_train_losses.append([loss.item() for loss in losses])
-            for loss in losses:
-                total_loss = total_loss + loss
+            if self.layer_ensembles:
+                losses = [criterion(output, target) for _, output in outputs.items()]  # DiceLoss and CrossEntropyLoss <- accepts logits
+                total_loss = 0
+                all_train_losses.append([loss.item() for loss in losses])
+                for loss in losses:
+                    total_loss = total_loss + loss
+            else:
+                total_loss = criterion(outputs, target)
+                all_train_losses.append(total_loss.item())
             total_loss.backward()
             train_loss += total_loss
             optimizer.step()
@@ -380,14 +292,27 @@ class BaseMethod:
                 for batch_idx, batch in enumerate(val_loader):
                     data, target = self.prepare_batch(batch, self.device)
                     outputs = model(data)
-                    # Get the output from the last head
-                    seg = torch.argmax(outputs[-1].squeeze(), dim=1).detach().cpu().numpy()
-                    lbl = torch.argmax(target.squeeze(), dim=1).detach().cpu().numpy()
+                    if self.layer_ensembles:
+                        # average the outputs of all heads
+                        # TODO TEST THIS!!!
+                        output = torch.stack([output for _, output in outputs.items()], dim=1).mean(dim=0)
+                        seg = torch.argmax(output, dim=1).detach().cpu().numpy()
+                    else:
+                        seg = torch.argmax(outputs.squeeze(), dim=1).detach().cpu().numpy()
+                    # lbl = torch.argmax(target.squeeze(), dim=1).detach().cpu().numpy()
+                    # TODO MULTI-CLASS SEGMENTATION!!! Maybe we should bring back the OneHot?
+                    lbl = target.squeeze().detach().cpu().numpy()
                     for s, l in zip(seg, lbl):
                         evals = get_evaluations(s, l, spacing=(1, 1))
                         val_dice.append(evals['dsc_seg'])
-                    loss = criterion(outputs[-1], target)  # Dice loss <- accepts logits
-                    val_loss += loss.item()
+                    if self.layer_ensembles:
+                        losses = [criterion(output, target) for _, output in outputs.items()]  # DiceLoss and CrossEntropyLoss <- accepts logits
+                        total_loss = 0
+                        for loss in losses:
+                            total_loss = total_loss + loss
+                    else:
+                        total_loss = criterion(outputs, target)
+                    val_loss += total_loss.item()
             assert all([dsc <= 1.0001 for dsc in val_dice])
             return val_loss / len(val_loader), sum(val_dice) / len(val_dice)
         elif self.task == Task.CLASSIFICATION:
@@ -417,18 +342,28 @@ class BaseMethod:
         else:
             raise ValueError(f'Unknown task: {self.task}')
 
-    def test(self, loader, T, active_learning_mode=False, w=256, h=256):
-        # Test images
-        len_dataset = len(loader.dataset)
+    def test(self, loader):
         if self.task == Task.SEGMENTATION:
-            iters = np.zeros((len_dataset, T, 2)+(w, h))
-            iters, images, labels, statuses, pathologies, outnames, area_under_agreement, prediction_depth_all = self.run_test_passes(self.model, loader, iters, T)
+            # Get predictions
+            predictions, images, labels = self.run_test_passes_segmentation(loader)
+            # Evaluate segmentation
+            seg_metrics = get_segmentation_metrics(predictions, labels, T=self.configs.SKIP_FIRST_T)
+            seg_metrics = pd.DataFrame(seg_metrics)
+            if self.layer_ensembles:
+                # Get uncertainty metrics
+                uncertainty_metrics, entropy_maps, variance_maps, mi_maps = get_uncertainty_metrics(predictions, labels, self.configs.SKIP_FIRST_T)
+                uncertainty_metrics = pd.DataFrame(uncertainty_metrics)
+                seg_metrics = pd.concat([seg_metrics, uncertainty_metrics], axis=1)                
+                kwargs = {'entropy_maps': entropy_maps, 'variance_maps': variance_maps, 'mi_maps': mi_maps, 'T': self.configs.SKIP_FIRST_T}
+            else:
+                kwargs = {}
             # Save results
-            self.save_segmentation_results(iters, images, labels, statuses, pathologies, outnames, area_under_agreement, prediction_depth_all, active_learning_mode=active_learning_mode)
+            seg_metrics.to_csv(self.metrics_out_path / self.results_csv_file)
+            save_segmentation_images(images, labels, predictions, self.figures_path, **kwargs)
         elif self.task == Task.CLASSIFICATION:
-            iters, truths, images, cam_hmaps = self.run_test_passes_classification(self.model, loader, T)
+            iters, truths, images, cam_hmaps = self.run_test_passes_classification(self.model, loader, self.configs.SKIP_FIRST_T)
             # Save results
-            self.save_classification_results(iters, truths, images, cam_hmaps, active_learning_mode=active_learning_mode)
+            self.save_classification_results(iters, truths, images, cam_hmaps)
         else:
             raise ValueError(f'Unknown task: {self.task}')
 
@@ -483,7 +418,7 @@ class BaseMethod:
         """Save results of classification task.
         iters torch.Tensor (N, T, C)
         truths torch.Tensor (N,)
-        seg_out_path str
+        metrics_out_path str
         results_csv_file str
         active_learning_mode bool
         """
@@ -570,7 +505,7 @@ class BaseMethod:
                     a.axis('off')
             fig.suptitle(f'true: {truths[i]} | pred: {y_pred.argmax()} | ent:{entropy:.2f} | var:{variance:.2f} | mi:{mi:.2f} | nll:{nll:.2f}')
             fig.tight_layout()
-            plt.savefig(f'{self.seg_out_path}/{i+1}.png', bbox_inches='tight')
+            plt.savefig(f'{self.metrics_out_path}/{i+1}.png', bbox_inches='tight')
             plt.close(fig)
             # neg_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][..., 0]))
             # pos_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][..., 1]))
@@ -585,7 +520,7 @@ class BaseMethod:
             # for a in ax:
             #     a.axis('off')
             # plt.suptitle(f'true: {truths[i]} | pred: {y_pred.argmax()} | ent:{entropy:.2f} | var:{variance:.2f} | mi:{mi:.2f} | nll:{nll:.2f}')
-            # plt.savefig(f'{self.seg_out_path}/{i+1}.png', bbox_inches='tight')
+            # plt.savefig(f'{self.metrics_out_path}/{i+1}.png', bbox_inches='tight')
             # plt.close(fig)
         
         preds = iters.mean(dim=1).softmax(dim=1).cpu().numpy()  # (N, T, C) -> (N, C)
@@ -599,108 +534,35 @@ class BaseMethod:
         results['variance'] = variance_all
         results['mi'] = mi_all
         df = pd.DataFrame(results)
-        df.to_csv(str(self.seg_out_path / self.results_csv_file))
+        df.to_csv(str(self.metrics_out_path / self.results_csv_file))
 
 
-    def run_test_passes_segmentation(self, model, loader, iters, T):
-        model.eval()
-        images = []
-        labels = []
-        statuses = []
-        outnames = []
-        pathologies = []
-        layer_agreement = []
-        all_agreements_for_plot = []
-        prediction_depth_all = [] # (N, T-1)
-        counter = 0
+    def run_test_passes_segmentation(self, loader):
+        self.model.eval()
+        predictions = []
+        images, labels = [], []
         with torch.no_grad():
-            # BEGIN OPPOSITE TO TMP BEGIN AND TMP END
-            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-            # END OPPOSITE TO TMP BEGIN AND TMP END
-            for i, batch in enumerate(tqdm(loader)):
-                img = batch['scan'][tio.DATA]
-                lbl = batch['mask'][tio.DATA].argmax(axis=1)
-                status = batch['status'][0]
-                pid = batch['patient_id'][0] if isinstance(batch['patient_id'][0], str) else batch['patient_id'][0].item()
-                sid = batch['study_id'][0] if isinstance(batch['study_id'][0], str) else batch['study_id'][0].item()
-                lid = batch['lesion_id'][0] if isinstance(batch['lesion_id'][0], str) else batch['lesion_id'][0].item()
-                outname = f"case_{i}-pid_{pid}-{batch['laterality'][0]}_{batch['view'][0]}-sid_{sid}-lid_{lid}.png"
-                outnames.append(outname)
-                images.append(np.squeeze(img.numpy()))
-                labels.append(np.squeeze(lbl.numpy()))
-                statuses.append('Benign' if status==0 else 'Malignant')
-                pathologies.append(batch['pathology'])
-                inputs, target = self.prepare_batch(batch, self.device)
-                outputs = self.forward(model, inputs)[-T:]  # skipping first N - T layers
-                # # TMP BEGIN Plots progression in the tmp folder
-                # fig, ax = plt.subplots(1, len(outputs)+3, figsize=(len(outputs)*5, 3))  # +3 is for the image, ground truth and prediction depth curve 
-                # ax[0].grid(False)
-                # ax[0].imshow(inputs.squeeze().cpu().numpy(), cmap='gray')
-                # ax[0].set_title('Input')
-                # ax[-2].grid(False)
-                # ax[-2].imshow(target.squeeze().cpu().numpy().argmax(axis=0), cmap='gray')
-                # ax[-2].set_title('Ground Truth')
-                # # TMP END
-                agreement = []  # agreement between layer output
-                # BEGIN OPPOSITE TO TMP BEGIN AND TMP END
-                last_layer = outputs[-1].squeeze().cpu().numpy().argmax(axis=0)
-                for j in range(len(outputs)):
-                    evals = get_evaluations(outputs[j].squeeze().cpu().numpy().argmax(axis=0), last_layer, spacing=(1, 1))
-                    agreement.append(evals['dsc_seg'])
-                # END OPPOSITE TO TMP BEGIN AND TMP END
-                # # TMP BEGIN Plots progression in the tmp folder
-                # prev_layer = outputs[0].squeeze().cpu().numpy().argmax(axis=0) 
-                # for j in range(1, len(outputs)+1):
-                #     cur_layer = outputs[j-1].squeeze().cpu().numpy().argmax(axis=0)
-                #     if j > 1:
-                #         evals = get_evaluations(prev_layer, cur_layer, spacing=(1, 1))
-                #         agreement.append(evals['dsc_seg'])
-                #         prev_layer = cur_layer
-                # # TMP END
-                # BEGIN OPPOSITE TO TMP BEGIN AND TMP END
-                # Prediction depth info
-                prediction_depth_all.append(agreement)
-                ax.plot(range(len(agreement)), agreement, color='green', alpha=0.2)
-                all_agreements_for_plot.append(agreement)
-                area_under_agreement = np.trapz(agreement, dx=1)
-                layer_agreement.append(-area_under_agreement)
-                # END OPPOSITE TO TMP BEGIN AND TMP END
-                # # TMP BEGIN Plots progression in the tmp folder
-                #     ax[j].grid(False)
-                #     ax[j].imshow(cur_layer, cmap='gray')
-                #     ax[j].set_title(f'Layer {j}')
-                # area_under_agreement = np.trapz(agreement, dx=1)
-                # ax[-1].plot(np.arange(len(agreement)), agreement, linewidth=2.)
-                # ax[-1].fill_between(np.arange(len(agreement)), np.zeros(len(agreement)), agreement, color='C0', hatch="/", alpha=0.3, label="AULA = {:.3f}".format(area_under_agreement))
-                # ax[-1].set_xticks(np.arange(len(agreement)), ['1-2', '2-3', '3-4', '4-5', '5-6', '6-7', '7-8', '8-9', '9-10'], rotation=45)
-                # ax[-1].set_ylim(0, 1)
-                # ax[-1].set_xlim(0, len(agreement)-1)
-                # ax[-1].set_title('Layer agreement (DSC)')
-                # ax[-1].legend(loc='center right')
-                # counter += 1
-                # plt.savefig('/tmp/nuem/'+str(counter)+'.png', bbox_inches='tight', pad_inches=0, dpi=300)
-                # plt.close()
-                # # TMP END
-                # early layers learn simple functions and easier samples first, later layers learn more complex functions and memorize details.
-                # The agreement between layers is a measure of how well the network is learning the details of the image.
-                # It basically shows the evolution of the network as it learns more complex functions.
-                # Hence, it can be used to measure the uncertainty of the network (both aleatoric and epistemic)
-                # Also, AULA is a good measure of the uncertainty of segmentation, because Var, MI, and Entropy are pixel-wise, wheras AULA gives a global image uncertainty.
-
-                for t in range(len(outputs)-T, len(outputs)):
-                    iters[i, t] = outputs[t].detach().cpu().numpy()
-            all_agreements_for_plot = np.asarray(all_agreements_for_plot)
-            ax.plot(range(all_agreements_for_plot.shape[1]), np.mean(all_agreements_for_plot, axis=0), color='red', linewidth=3.0, label='Mean')
-            ax.legend()
-            ax.set_title('Layer agreement')
-            ax.set_xlabel('Layer')
-            # ax.set_ylabel('DSC')
-            ax.set_ylabel('MHD')
-            ax.set_xlim(0, T)
-            # ax.set_ylim(0, 1)
-            plt.savefig('All_layer_agreement.png', dpi=300)
-            plt.close()
-        return iters, images, labels, statuses, pathologies, outnames, layer_agreement, prediction_depth_all
+            for batch in tqdm(loader):
+                # test batch
+                inputs, targets = self.prepare_batch(batch, self.device)
+                outputs = self.forward(self.model, inputs)
+                if self.layer_ensembles:
+                    # outputs is a dict of {'layer_name': (B, C, H, W)} T times
+                    # concatenate all the outputs to get a (B, T, C, H, W)
+                    outputs = torch.stack([output for _, output in outputs.items()], dim=1)
+                    predictions.append(outputs.cpu().numpy())
+                else:
+                    # outputs is a tensor of (B, C, H, W)
+                    # just add it to the list
+                    predictions.append(outputs.cpu().numpy())
+                # save images and labels for visualization and evaluation
+                images.append(inputs.squeeze().cpu().numpy())  # (B, H, W)
+                labels.append(targets.squeeze().cpu().numpy())  # (B, H, W)
+        # concatenate all batches to get (N, T, C, H, W) or (N, C, H, W)
+        predictions = np.concatenate(predictions, axis=0)
+        images = np.concatenate(images, axis=0)
+        labels = np.concatenate(labels, axis=0)
+        return predictions, images, labels
 
     def save_segmentation_results(self, iters, images, labels, statuses, pathologies, outnames, area_under_agreement, prediction_depth_all, active_learning_mode=False):
         # segmentation
@@ -726,16 +588,16 @@ class BaseMethod:
             # TODO - flag for using average or STAPLE
             # Final segmentation
             # 1) Average over all
-            # tmp = it.mean(axis=0)
-            # seg = tmp.argmax(axis=0)
+            tmp = it.mean(axis=0)
+            seg = tmp.argmax(axis=0)
             # 2) STAPLE
-            tmp = it.argmax(axis=1)  # (T, C, H, W) -> (T, H, W)
-            seg_stack = [sitk.GetImageFromArray(tmp[i].astype(np.int16)) for i in range(T)]
-            # Run STAPLE algorithm
-            STAPLE_seg_sitk = sitk.STAPLE(seg_stack, 1.0) # 1.0 specifies the foreground value
-            # convert back to numpy array
-            seg = sitk.GetArrayFromImage(STAPLE_seg_sitk)
-            seg[seg < 0.000001] = 0
+            # tmp = it.argmax(axis=1)  # (T, C, H, W) -> (T, H, W)
+            # seg_stack = [sitk.GetImageFromArray(tmp[i].astype(np.int16)) for i in range(self.configs.TEST_T)]
+            # # Run STAPLE algorithm
+            # STAPLE_seg_sitk = sitk.STAPLE(seg_stack, 1.0) # 1.0 specifies the foreground value
+            # # convert back to numpy array
+            # seg = sitk.GetArrayFromImage(STAPLE_seg_sitk)
+            # seg[seg < 0.000001] = 0
             # 3) Final layer only
             # seg = it[-1].argmax(axis=0)
 
@@ -841,15 +703,15 @@ class BaseMethod:
                     a.axis('off')
                 plt.tight_layout()
                 # plt.show()
-                plt.savefig(str(self.seg_out_path / out_name), bbox_inches='tight')  # , dpi=300)
-                # plt.savefig(str(seg_out_path / str(out_name+'.eps')), bbox_inches='tight' , dpi=300)
+                plt.savefig(str(self.metrics_out_path / out_name), bbox_inches='tight')  # , dpi=300)
+                # plt.savefig(str(metrics_out_path / str(out_name+'.eps')), bbox_inches='tight' , dpi=300)
                 plt.close(fig=fig)
 
         df = pd.DataFrame(results)
         if not active_learning_mode:
-            df.to_csv(str(self.seg_out_path / self.results_csv_file))
-            pickle.dump(calibration_pairs, open(str(self.seg_out_path / str(self.results_csv_file[:-4]+"-calibration_pairs.pkl")), "wb"))
-            pickle.dump(prediction_depth_all, open(str(self.seg_out_path / str(self.results_csv_file[:-4]+"-prediction_depth_all.pkl")), "wb"))
-            return self.seg_out_path / self.results_csv_file
+            df.to_csv(str(self.metrics_out_path / self.results_csv_file))
+            pickle.dump(calibration_pairs, open(str(self.metrics_out_path / str(self.results_csv_file[:-4]+"-calibration_pairs.pkl")), "wb"))
+            pickle.dump(prediction_depth_all, open(str(self.metrics_out_path / str(self.results_csv_file[:-4]+"-prediction_depth_all.pkl")), "wb"))
+            return self.metrics_out_path / self.results_csv_file
         else:
             return df

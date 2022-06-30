@@ -1,30 +1,25 @@
-import torch
-from data.optimam_loader import optimam_healthy_nonhealthy_extraction
-from segmentation_models_pytorch.unet.model import Unet
-from torchsummary import summary
-import pandas as pd
-from torchvision.models import resnet18, resnet34, densenet121
+# import torch
+# from data.optimam_loader import optimam_healthy_nonhealthy_extraction
+# from segmentation_models_pytorch.unet.model import Unet
+# from torchsummary import summary
+# import pandas as pd
+# from torchvision.models import resnet18, resnet34, densenet121
 
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
+# from methods.base_method_plain import BaseMethodPlain
+# from methods.base_method_mnm_plain import BaseMethodMnMPlain
+# from methods.base_method_mnm import BaseMethodMnM
+# from methods.deep_ensembles_mnm import DeepEnsemblesMnM
+# from methods.commons import get_model_for_task
+# from methods.layer_ensembles import LayerEnsembles
+# from utils import Task, Organ
+# from data.mmg_detection_datasets import OPTIMAMDataset
+
 import configs 
 from methods.base_method import BaseMethod
-from methods.base_method_plain import BaseMethodPlain
-from methods.base_method_mnm_plain import BaseMethodMnMPlain
-from methods.base_method_mnm import BaseMethodMnM
-from methods.deep_ensembles_mnm import DeepEnsemblesMnM
-from methods.commons import get_model_for_task
-from methods.layer_ensembles import LayerEnsembles
-from utils import Task, Organ
-from data.mmg_detection_datasets import OPTIMAMDataset
 
 if __name__ == '__main__':
-    if configs.DATASET == 'mnm':
-        # method = DeepEnsemblesMnM(configs, num_ensembles=configs.NUM_ENSEMBLES)
-        method = BaseMethodMnM(configs)
-        # method = BaseMethodMnMPlain(configs)
-    else: 
-        method = BaseMethod(configs, layer_ensembles=True)
-        # method = BaseMethodPlain(configs)
+    method = BaseMethod(configs, layer_ensembles=configs.IS_LAYER_ENSEMBLES)
     method.run_routine()
 
     # architecture = resnet34(weights=None, num_classes=2)

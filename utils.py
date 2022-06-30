@@ -13,31 +13,6 @@ from PIL import Image
 from scipy.ndimage.morphology import binary_erosion
 from scipy.ndimage.interpolation import map_coordinates
 from scipy.ndimage.filters import gaussian_filter
-from operator import itemgetter, mul
-from functools import partial, reduce
-
-# # from segmentation_models_pytorch.losses.boundary_loss import one_hot2dist
-# from typing import Callable, Tuple, Union
-# from torch import Tensor
-
-# # Boundary-loss functions -------- Begin
-# D = Union[Image.Image, np.ndarray, Tensor]
-# def gt_transform(resolution: Tuple[float, ...], K: int) -> Callable[[D], Tensor]:
-#         return transforms.Compose([
-#                 lambda img: np.array(img)[...],
-#                 lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],  # Add one dimension to simulate batch
-#                 # partial(class2one_hot, K=K),
-#                 itemgetter(0)  # Then pop the element to go back to img shape
-#         ])
-
-# def dist_map_transform(resolution: Tuple[float, ...], K: int) -> Callable[[D], Tensor]:
-#         return transforms.Compose([
-#                 gt_transform(resolution, K),
-#                 lambda t: t.cpu().numpy(),
-#                 partial(one_hot2dist, resolution=resolution),
-#                 lambda nd: torch.tensor(nd, dtype=torch.float32)
-#         ])
-# # Boundary-loss functions --------- End
 
 class Task(enum.Enum):
     CLASSIFICATION = 'classification'
@@ -191,41 +166,41 @@ class ResampleToMask(object):
 class RandomMammoArtefact():
     pass
 
-def dice_loss(logits, true, eps=1e-7):
-    """Computes the Sørensen–Dice loss.
-    Note that PyTorch optimizers minimize a loss. In this
-    case, we would like to maximize the dice loss so we
-    return the negated dice loss.
-    Args:
-        logits: a tensor of shape [B, C, H, W]. Corresponds to
-            the raw output or logits of the model.
-        true: a tensor of shape [B, 1, H, W].
-        eps: added to the denominator for numerical stability.
-    Returns:
-        dice_loss: the Sørensen–Dice loss.
-    """
-    num_classes = logits.shape[1]
-    if num_classes == 1:
-        true_1_hot = torch.eye(num_classes + 1)[true.squeeze(1)]
-        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
-        true_1_hot_f = true_1_hot[:, 0:1, :, :]
-        true_1_hot_s = true_1_hot[:, 1:2, :, :]
-        true_1_hot = torch.cat([true_1_hot_s, true_1_hot_f], dim=1)
-        pos_prob = torch.sigmoid(logits)
-        neg_prob = 1 - pos_prob
-        probas = torch.cat([pos_prob, neg_prob], dim=1)
-    else:
-        true_1_hot = torch.eye(num_classes)[true.squeeze(1).to(torch.int64)]
-        # to .contigious() to suppress channels_last mixed tensor memory format
-        true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
-        # true_1_hot = true_1_hot.permute(0, 3, 1, 2).contiguous().float()
-        probas = F.softmax(logits, dim=1)
-    true_1_hot = true_1_hot.type(logits.type())
-    dims = (0,) + tuple(range(2, true.ndimension()))
-    intersection = torch.sum(probas * true_1_hot, dims)
-    cardinality = torch.sum(probas + true_1_hot, dims)
-    dice_loss = (2. * intersection / (cardinality + eps)).mean()
-    return (1 - dice_loss)
+# def dice_loss(logits, true, eps=1e-7):
+#     """Computes the Sørensen–Dice loss.
+#     Note that PyTorch optimizers minimize a loss. In this
+#     case, we would like to maximize the dice loss so we
+#     return the negated dice loss.
+#     Args:
+#         logits: a tensor of shape [B, C, H, W]. Corresponds to
+#             the raw output or logits of the model.
+#         true: a tensor of shape [B, 1, H, W].
+#         eps: added to the denominator for numerical stability.
+#     Returns:
+#         dice_loss: the Sørensen–Dice loss.
+#     """
+#     num_classes = logits.shape[1]
+#     if num_classes == 1:
+#         true_1_hot = torch.eye(num_classes + 1)[true.squeeze(1)]
+#         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+#         true_1_hot_f = true_1_hot[:, 0:1, :, :]
+#         true_1_hot_s = true_1_hot[:, 1:2, :, :]
+#         true_1_hot = torch.cat([true_1_hot_s, true_1_hot_f], dim=1)
+#         pos_prob = torch.sigmoid(logits)
+#         neg_prob = 1 - pos_prob
+#         probas = torch.cat([pos_prob, neg_prob], dim=1)
+#     else:
+#         true_1_hot = torch.eye(num_classes)[true.squeeze(1).to(torch.int64)]
+#         # to .contigious() to suppress channels_last mixed tensor memory format
+#         true_1_hot = true_1_hot.permute(0, 3, 1, 2).float()
+#         # true_1_hot = true_1_hot.permute(0, 3, 1, 2).contiguous().float()
+#         probas = F.softmax(logits, dim=1)
+#     true_1_hot = true_1_hot.type(logits.type())
+#     dims = (0,) + tuple(range(2, true.ndimension()))
+#     intersection = torch.sum(probas * true_1_hot, dims)
+#     cardinality = torch.sum(probas + true_1_hot, dims)
+#     dice_loss = (2. * intersection / (cardinality + eps)).mean()
+#     return (1 - dice_loss)
 
 def make_folders(base_path, experiment_name):
     ''' Create experiment folder with subfolders figures, models, segmentations
@@ -239,27 +214,14 @@ def make_folders(base_path, experiment_name):
     results_path = Path(base_path / experiment_name)
     figures_path = results_path / 'figures'
     models_path = results_path / 'models'
-    seg_out_path = results_path / 'segmentations'
+    metrics_out_path = results_path / 'metrics'
     if not results_path.exists():
         results_path.mkdir(parents=True)
         figures_path.mkdir()
         models_path.mkdir()
-        seg_out_path.mkdir()
+        metrics_out_path.mkdir()
 
-    return models_path, figures_path, seg_out_path
-
-
-def variable_batch_collate(batch):
-    '''Collate function for batches with images of different sizes.
-    Arguments
-        :list batch: list of tuples (data, target)
-    Returns
-        :tuple (data, target)
-    '''
-    data = [item['scan']['data'] for item in batch]
-    target = [item['status'] for item in batch]
-    target = torch.LongTensor(target)
-    return [data, target]
+    return models_path, figures_path, metrics_out_path
 
 def bbox2(img):
     rows = np.any(img, axis=1)

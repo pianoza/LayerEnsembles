@@ -12,25 +12,45 @@ from torch.nn import ModuleList
 from utils import Task, Organ
 from methods.layer_ensembles import LayerEnsembles
 
-def get_model_for_task(task, organ, layer_ensembles, encoder_weights=None):
+def get_model_for_task(task, organ, layer_ensembles, target_shape, encoder_weights=None):
     # TODO check the number of classes for cardiac (segmentation: 4, classification: ?)
     num_classes = 2 if organ == Organ.BREAST else 4  
     if task == Task.SEGMENTATION:
-        model = Unet(
+        architecture = Unet(
             encoder_name="resnet18",
             encoder_weights=encoder_weights,
             decoder_channels=(1024, 512, 256, 128, 64),
             decoder_attention_type='scse',
             in_channels=1,
             classes=num_classes,
-            layer_ensembles=layer_ensembles,
         )
-        return model 
+        if not layer_ensembles:
+            return architecture, []
+        all_layers = dict([*architecture.named_modules()])
+        intermediate_layers = []
+        for name, layer in all_layers.items():
+            # Change .relu to any other component e.g., .bn or .conv the '.' is to include only sub-modules (exclude stem)
+            if '.relu' in name:
+                intermediate_layers.append(name)
+        # Init LayerEnsembles with the names of the intermediate layers to use as outputs
+        model = LayerEnsembles(architecture, intermediate_layers)
+        # Dummy input to get the output shapes of the layers
+        x = torch.zeros(target_shape)
+        output = model(x)
+        out_channels = []
+        scale_factors = []
+        for _, val in output.items():
+            out_channels.append(val.shape[1])
+            scale_factors.append(target_shape[-1] // val.shape[-1])
+        # Set the output heads with the number of channels of the output layers
+        model.set_output_heads(in_channels=out_channels, scale_factors=scale_factors, task=Task.SEGMENTATION, classes=2)
+        return model, intermediate_layers
     elif task == Task.CLASSIFICATION:
         architecture = models.resnet18(weights=None, num_classes=2)
         if not layer_ensembles:
-            return architecture
+            return architecture, []
         architecture.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # TODO Avoid repetition here!!! This is the same as in all other tasks
         # Useful to get the names of the layers to use in the layer ensembles
         all_layers = dict([*architecture.named_modules()])
         intermediate_layers = []
@@ -44,30 +64,20 @@ def get_model_for_task(task, organ, layer_ensembles, encoder_weights=None):
         x = torch.randn(1, 1, 128, 128)
         output = model(x)
         out_channels = []
-        for key, val in output.items():
+        for _, val in output.items():
             out_channels.append(val.shape[1])
         # Set the output heads with the number of channels of the output layers
         model.set_output_heads(in_channels=out_channels, task=Task.CLASSIFICATION, classes=2)
-        # model = EncoderModel(
-        #     encoder_name="resnet18",
-        #     encoder_depth=5,
-        #     encoder_weights=encoder_weights,
-        #     in_channels=1,
-        #     classes=num_classes,
-        #     activation=None,
-        #     dropout=None,  # TODO pass as parameter
-        #     layer_ensembles=layer_ensembles,
-        # )
         return model, intermediate_layers
     else:
         raise ValueError('Unknown task: {}'.format(task))
 
 
-def get_criterion_for_task(task):
+def get_criterion_for_task(task, classes):
     if task == Task.SEGMENTATION:
         return DiceLoss(
-            mode='multilabel',
-            classes=[1,],
+            mode='multiclass',
+            classes=classes,
             log_loss=False,
             from_logits=True,
             smooth=0.0000001,

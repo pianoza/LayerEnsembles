@@ -6,27 +6,22 @@ class SegmentationModel(torch.nn.Module):
 
     def initialize(self):
         init.initialize_decoder(self.decoder)
-        init.initialize_head(self.segmentation_heads)
+        init.initialize_head(self.segmentation_head)
         if self.classification_head is not None:
             init.initialize_head(self.classification_head)
 
     def forward(self, x):
         """Sequentially pass `x` trough model`s encoder, decoder and heads"""
         features = self.encoder(x)
+        decoder_output = self.decoder(*features)
 
-        if self.layer_ensembles:
-            all_outputs = self.decoder(*features)
-            all_masks = [segmentation_head(output) for segmentation_head, output in zip(self.segmentation_heads, all_outputs)]
-        else:
-            all_outputs = self.decoder(*features)
-            all_masks = self.segmentation_heads(all_outputs)
+        masks = self.segmentation_head(decoder_output)
 
         if self.classification_head is not None:
             labels = self.classification_head(features[-1])
-            # return masks, labels
-            return all_masks, labels
+            return masks, labels
 
-        return all_masks
+        return masks
 
     def predict(self, x):
         """Inference method. Switch model to `eval` mode, call `.forward(x)` with `torch.no_grad()`
