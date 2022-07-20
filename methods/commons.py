@@ -46,10 +46,11 @@ def get_model_for_task(task, organ, layer_ensembles, target_shape, encoder_weigh
         model.set_output_heads(in_channels=out_channels, scale_factors=scale_factors, task=Task.SEGMENTATION, classes=2)
         return model, intermediate_layers
     elif task == Task.CLASSIFICATION:
-        architecture = models.resnet18(weights=None, num_classes=2)
+        architecture = models.resnet18(pretrained=True)
+        architecture.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        architecture.fc = torch.nn.Linear(512, num_classes)
         if not layer_ensembles:
             return architecture, []
-        architecture.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         # TODO Avoid repetition here!!! This is the same as in all other tasks
         # Useful to get the names of the layers to use in the layer ensembles
         all_layers = dict([*architecture.named_modules()])

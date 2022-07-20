@@ -12,11 +12,13 @@ def get_transforms(task, num_classes, target_image_size=256,
         # tio.OneHot(num_classes=num_classes),
         ]
     clf_preprocess = [
-        tio.Resize((target_image_size, target_image_size, 1)),
-        tio.Resample((4, 4, 1)),  # Downsample by 4, e.g., 1024 -> 256, 2560 -> 640
+        # tio.Resize((target_image_size, target_image_size, 1)),
+        # tio.Resample((4, 4, 1)),  # Downsample by 4, e.g., 1024 -> 256, 2560 -> 640
+        ResampleToMask(im_size=target_image_size),
+        tio.CropOrPad((target_image_size, target_image_size, 1), mask_name='mask'),
         tio.RescaleIntensity(out_min_max=(min_intensity, max_intensity), percentiles=(min_percentile, max_percentile), masking_method='mask'),
         tio.ZNormalization(masking_method='mask'),
-        # tio.OneHot(num_classes=num_classes),
+        tio.OneHot(num_classes=num_classes),
         ]
     aug_transforms = [
         tio.RandomFlip(axes=(0, 1), p=0.2),

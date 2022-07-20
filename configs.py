@@ -5,34 +5,36 @@ from utils import Task, Organ
 # CLASSIFICATION LABELS: 1->Malignant; 0->Benign
 RANDOM_SEED = 13
 
-SKIP_FIRST_T = 0  # 0 -> no skipping
+SKIP_FIRST_T = 3  # 0 -> no skipping
 TASK = Task.SEGMENTATION  # Task.CLASSIFICATION | Task.REGRESSION | Task.SEGMENTATION
-ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
-IS_LAYER_ENSEMBLES = True
+# ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
+IS_LAYER_ENSEMBLES = False
+SAVE_SEGMENTATION_OUTPUTS = False  # if False, only evaluation metrics are saved
 
 # EXPERIMENT_NAME = 'BCDR_segmentation_test'
-EXPERIMENT_NAME = 'BCDR_LE_segmentation_test'
-print(f'RUNNING EXPERIMENT {EXPERIMENT_NAME}')
+# EXPERIMENT_NAME = 'BCDR_LE_segmentation_test'
+# EXPERIMENT_NAME = 'OPTIMAM_classifcation_test'
+# EXPERIMENT_NAME = 'Inbreast_classification_test'
+# EXPERIMENT_NAME = 'BCDR_seg_full_set'  # 576 samples
+# EXPERIMENT_NAME = 'BCDR_seg_half_set'  # 288 samples
+# EXPERIMENT_NAME = 'BCDR_seg_quarter_set'  # 144 samples
+# EXPERIMENT_NAME = 'BCDR_seg_quarter_of_quarter_set'  # 36 samples
+EXPERIMENT_NAME = 'Plain_MnM_seg_test'
 
-# TODO
-'''
-1) 
-Plot likelihood vs layer 
-x-axis -> layer number
-y-axis -> likelihood (predicted probability of the class)
-2) make a more continuous change: add more intermediate layers 2x(basicblock(2(conv+relu+bn))+maxpool)
-3) add more layer to the network and skip early layers
-4) AULA like metric by comparing the probabilities of each classification head
-'''
+print(f'RUNNING EXPERIMENT {EXPERIMENT_NAME}')
 
 if 'BCDR' in EXPERIMENT_NAME:
     DATASET = 'bcdr'
+    ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
 elif 'Inbreast' in EXPERIMENT_NAME:
     DATASET = 'inbreast'
+    ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
 elif 'OPTIMAM' in EXPERIMENT_NAME:
     DATASET = 'optimam'
+    ORGAN = Organ.BREAST  # Organ.BREAST | Organ.HEART
 elif 'MnM' in EXPERIMENT_NAME:
     DATASET = 'mnm'
+    ORGAN = Organ.HEART  # Organ.BREAST | Organ.HEART
 else:
     raise ValueError(f'Unknown dataset in Experiment {EXPERIMENT_NAME}')
 
@@ -55,7 +57,7 @@ PLOT_VALIDATION_FREQUENCY = 10
 RESULTS_PATH = SOURCE_CODE_PATH / 'results'
 
 DROPOUT_RATE = 0.0
-NUM_EPOCHS = 5  # 200
+NUM_EPOCHS = 30  # 200
 EARLY_STOPPING_PATIENCE = 200
 SCHEDULER_PATIENCE = 100  # NOTE same as num epochs, never reduces lr 
 BATCH_SIZE = 5

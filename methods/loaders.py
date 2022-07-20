@@ -25,12 +25,16 @@ def get_loaders(dataset, train_transforms, test_transforms, train_val_test_split
         # Print number of unique patient_ids in the data frame
         print(f'BCDR ---- TOTAL NUMBER OF SAMPLES: {df.shape[0]}')
         df_train, df_val, df_test = unique_group_train_val_test_split(df, train_val_test_split)
+        # randomly drop half of the samples from df_train
+        df_train = df_train.sample(frac=0.0625, random_state=configs.RANDOM_SEED)
         print(f'SPLITS ---- {df_train.shape[0]} TRAINING, {df_val.shape[0]} VALIDATION, {df_test.shape[0]} TESTING')
         train_dataset = BCDRLoader(df_train, transform=train_transforms)
         val_dataset = BCDRLoader(df_val, transform=test_transforms)
         test_dataset = BCDRLoader(df_test, transform=test_transforms)
     elif dataset == 'inbreast':
-        df = get_inbreast_subjects(configs.INBREAST_INFO_FILE, configs.TASK)
+        # df = get_inbreast_subjects(configs.INBREAST_INFO_FILE, configs.TASK)
+        # TODO remove the hard coded TASK
+        df = get_inbreast_subjects(configs.INBREAST_INFO_FILE, Task.SEGMENTATION)  # for now, to keep the mass mask
         print(f'INBREAST ---- TOTAL NUMBER OF SAMPLES: {df.shape[0]}')
         if train_val_test_split[0] == 0. and train_val_test_split[1] == 0:
             print('ALL SAMPLES FOR TESTING!')

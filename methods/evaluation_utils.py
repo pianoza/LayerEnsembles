@@ -71,6 +71,10 @@ def get_uncertainty_metrics(predictions, labels, T):
     entropy_sum = []
     variance_sum = []
     mi_sum = []
+    # area under layer agreement curve AULA
+    aula_per_class = dict()
+    for i in range(1, num_classes):  # ignore background
+        aula_per_class[f'aula_{i}'] = []
     # calibration (NLL)
     nlls = []
         
@@ -78,7 +82,6 @@ def get_uncertainty_metrics(predictions, labels, T):
     labels = np.eye(num_classes)[labels.astype(np.uint8)]  # (N, H, W) -> (N, H, W, C)
     labels = np.transpose(labels, (0, 3, 1, 2))  # (N, H, W, C) -> (N, C, H, W)
 
-    num_classes = predictions.shape[1]
     for predicted, label in zip(predictions, labels):
         # softmax along channel axis (NH, C, H, W)
         pred = scipy.special.softmax(predicted[T:, ...], axis=1)
@@ -102,6 +105,19 @@ def get_uncertainty_metrics(predictions, labels, T):
         mi_maps.append(mi)
         mi_sum.append(np.sum(mi))
 
+        # calculate Area Under Layer Agreement Curve (AULA)
+        for i in range(1, num_classes):  # ignore background
+            agreement = []
+            prev_layer = pred[0, i]
+            for j in range(1, num_heads-T):
+                cur_layer = pred[j, i]
+                dsc = get_evaluations(cur_layer, prev_layer, spacing=(1, 1))['dsc_seg']
+                agreement.append(dsc)
+                prev_layer = cur_layer
+            aula = np.trapz(agreement, dx=1)
+            aula_per_class[f'aula_{i}'].append(-aula)
+
+
         # calculate negative log-likelihood
         # label (C, H, W); avg_pred (C, H, W)
         nll = -np.mean(np.sum(label * np.log(avg_pred + 1e-5), axis=0))
@@ -113,6 +129,7 @@ def get_uncertainty_metrics(predictions, labels, T):
         'mi': mi_sum,
         'nll': nlls
     }
+    metrics.update(aula_per_class)
     return metrics, entropy_maps, variance_maps, mi_maps
 
 def save_segmentation_images(images, labels, predictions, out_path, **kwargs):

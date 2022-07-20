@@ -23,7 +23,7 @@ from methods.evaluation_utils import get_segmentation_metrics, get_uncertainty_m
 
 from pathlib import Path
 from PIL import Image
-import SimpleITK as sitk 
+from torchsummary import summary
 
 from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
@@ -68,6 +68,8 @@ class BaseMethod:
             print(f'TESTING ONLY')
             # self.model = self.prepare_model(self.final_model_path)
             self.model, self.intermediate_layers = self.prepare_model(target_shape=self.target_shape, model_path=self.best_model_path)
+            # summary(self.model, (1, 256, 256))
+            # return
         else:
             # If not exists or overwriting, create new model and start training
             # Initialise model, loss, optimiser, scheduler, and early_stopping
@@ -150,7 +152,10 @@ class BaseMethod:
         for alpha, epoch in zip(np.linspace(0.01, 0.99, num=self.num_epochs), range(self.num_epochs)):
             # Train
             train_loss, all_head_losses = self.train_epoch(self.model, train_loader, self.criterion, self.optimizer, alpha)
-            print(f'EPOCH {epoch}: All head losses:', all_head_losses)
+            if self.layer_ensembles:
+                print(f'EPOCH {epoch}/{self.num_epochs}: All head losses:', all_head_losses)
+            else:
+                print(f'EPOCH {epoch}/{self.num_epochs}: Loss:', all_head_losses)
             # Validate
             if self.task == Task.SEGMENTATION:
                 val_loss, val_dice = self.validate_epoch(self.model, val_loader, self.criterion, alpha)
@@ -162,7 +167,7 @@ class BaseMethod:
             self.scheduler.step(val_loss)
             if self.task == Task.CLASSIFICATION:
                 clf_report = classification_report(truths, preds.argmax(axis=1), digits=4, output_dict=True)
-                val_loss = -clf_report['weighted avg']['f1-score']  # Negative because we want to maximize the metric
+                # val_loss = -clf_report['weighted avg']['f1-score']  # Negative because we want to maximize the metric
             self.early_stopping(val_loss, self.model)
             # Push to tensorboard if enabled
             if self.tb_writer is not None:
@@ -324,16 +329,17 @@ class BaseMethod:
                 for batch_idx, batch in enumerate(val_loader):
                     data, target = self.prepare_batch(batch, self.device)
                     outputs = model(data)
-                    # loss = criterion(outputs[-1], target)  # CrossEntropyLoss <- accepts logits
-                    losses = [criterion(output, target) for _, output in outputs.items()]
                     total_loss = 0
-                    for loss in losses:
-                        total_loss = total_loss + loss
+                    if self.layer_ensembles:
+                        losses = [criterion(output, target) for _, output in outputs.items()]
+                        for loss in losses:
+                            total_loss = total_loss + loss
+                        mean_outputs = torch.stack([out for _, out in outputs.items()]).mean(dim=0)
+                        pred = mean_outputs.softmax(dim=1).detach().cpu().numpy()
+                    else:
+                        total_loss = criterion(outputs, target)
+                        pred = outputs.softmax(dim=1).detach().cpu().numpy()
                     val_loss += total_loss
-                    # TODO instead of taking the last head, take an average
-                    # Softmax the last head
-                    mean_outputs = torch.stack([out for _, out in outputs.items()]).mean(dim=0)
-                    pred = mean_outputs.softmax(dim=1).detach().cpu().numpy()
                     all_predictions.append(pred)
                     all_truths.append(target.detach().cpu().numpy())
             all_predictions = np.concatenate(all_predictions, axis=0)
@@ -359,80 +365,41 @@ class BaseMethod:
                 kwargs = {}
             # Save results
             seg_metrics.to_csv(self.metrics_out_path / self.results_csv_file)
-            save_segmentation_images(images, labels, predictions, self.figures_path, **kwargs)
+            if self.configs.SAVE_SEGMENTATION_OUTPUTS:
+                save_segmentation_images(images, labels, predictions, self.figures_path, **kwargs)
         elif self.task == Task.CLASSIFICATION:
-            iters, truths, images, cam_hmaps = self.run_test_passes_classification(self.model, loader, self.configs.SKIP_FIRST_T)
+            preds, truths = self.run_test_passes_classification(self.model, loader, self.configs.SKIP_FIRST_T)
             # Save results
-            self.save_classification_results(iters, truths, images, cam_hmaps)
+            self.save_classification_results(preds, truths)
         else:
             raise ValueError(f'Unknown task: {self.task}')
 
     def run_test_passes_classification(self, model, loader, T):
         model.eval()
         truths = []
-        iters = []
-        images = []
-        cam_hmaps = []
-        use_cuda = True if self.configs.DEVICE == 'cuda' else False
-        # GradCAM models for each classification head
-        # TODO automatic SingleOutputModel population based on the number of output_heads in the model
-        all_outputs = self.intermediate_layers + ['final']
-        num_intermediate_layers = len(all_outputs)
-        cam_models = [SingleOutputModel(model, layer) for layer in all_outputs]
-        # cam_models = [SingleOutputModel(model, ''), SingleOutputModel(model, 1),
-        #               SingleOutputModel(model, 2), SingleOutputModel(model, 3), SingleOutputModel(model, 4)]
-        # target_layers = [cam_models[0].model.encoder.relu,
-        #                  cam_models[1].model.encoder.layer1[-1].bn2, cam_models[2].model.encoder.layer2[-1].bn2,
-        #                  cam_models[3].model.encoder.layer3[-1].bn2, cam_models[4].model.encoder.layer4[-1].bn2,]
-        # target_layers = [cam_models[0].model.output_heads[0][4],  # activation layer of the classification head
-        #                  cam_models[1].model.output_heads[1][4], cam_models[2].model.output_heads[2][4],
-        #                  cam_models[3].model.output_heads[3][4], cam_models[4].model.output_heads[4][4]]
-        target_layers = [cam_models[i].model.output_heads[i][4] for i in range(num_intermediate_layers-1)] + [cam_models[-1].model.model.fc]
-        neg_cam_target = [ClassifierOutputTarget(0)]
-        pos_cam_target = [ClassifierOutputTarget(1)]
-        for i, batch in enumerate(tqdm(loader)):
+        preds = []
+        if self.layer_ensembles:
+            raise NotImplementedError('Layer ensembles not implemented for classification')
+        else:
             with torch.no_grad():
-                inputs, targets = self.prepare_batch(batch, self.device)
-                images.append(inputs.cpu().numpy())
-                truths.append(targets.cpu().numpy())
-                outputs = self.forward(model, inputs)  # [-T:]  # skipping first N - T layers
-                tmp = torch.stack([out for _, out in outputs.items()], dim=1) # (BS, T, C)
-                iters.append(tmp)
-            # GradCAM heatmaps
-            # Now for the last layer only
-            all_cams = []
-            for k in range(num_intermediate_layers):
-                cam = GradCAM(model=cam_models[k], target_layers=[target_layers[k]], use_cuda=use_cuda)
-                neg_grayscale_cam = cam(input_tensor=inputs, targets=neg_cam_target)  #, aug_smooth=True, eigen_smooth=True)
-                pos_grayscale_cam = cam(input_tensor=inputs, targets=pos_cam_target)  #, aug_smooth=True, eigen_smooth=True)
-                grayscale_cam = np.stack([neg_grayscale_cam, pos_grayscale_cam], axis=3)  # (BS, H, W, 2)
-                all_cams.append(grayscale_cam)
-            cam_hmaps.append(all_cams)  # [N x [ClfHead0, ClfHead1, ...]]
-        images = [im.squeeze() for bat in images for im in bat]
-        # cam_hmaps = [hmap for bat in cam_hmaps for hmap in bat]
-        iters = torch.cat(iters, dim=0) # (N*BS, T, C)
-        truths = np.concatenate(truths, axis=0) # (N*BS,)
-        return iters, truths, images, cam_hmaps
+                for i, batch in enumerate(tqdm(loader)):
+                    inputs, targets = self.prepare_batch(batch, self.device)
+                    truths.append(targets.cpu().numpy())
+                    outputs = self.forward(model, inputs)
+                    preds.append(outputs.softmax(dim=1).detach().cpu().numpy())
+            preds = np.concatenate(preds, axis=0)
+            truths = np.concatenate(truths, axis=0)
+        return preds, truths
 
-    def save_classification_results(self, iters, truths, images, cam_hmaps, active_learning_mode=False):
-        """Save results of classification task.
-        iters torch.Tensor (N, T, C)
-        truths torch.Tensor (N,)
-        metrics_out_path str
-        results_csv_file str
-        active_learning_mode bool
-        """
-        # average over all heads
-        preds = iters.mean(dim=1)
-        # softmax over all classes
-        preds = preds.softmax(dim=1)
+    def save_classification_results(self, preds, truths):
         # classification report
-        print(classification_report(truths, preds.argmax(dim=1).cpu().numpy()))
+        print(classification_report(truths, preds.argmax(axis=1)))
         # split two classes
         positive = preds[:, 1]
         negative = preds[:, 0]
+
         # plot ROC curve
-        fpr, tpr, _ = roc_curve(truths, positive.cpu().numpy())
+        fpr, tpr, _ = roc_curve(truths, positive)
         roc_auc = auc(fpr, tpr)
         fig, ax = plt.subplots(figsize=(8, 7))
         ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='r', label='Chance', alpha=.8)
@@ -443,9 +410,10 @@ class BaseMethod:
         ax.legend(loc="lower right")
         fig.savefig(f'{self.figures_path}/TestSetROC.png')
         plt.close(fig)
+
         # plot Precision-Recall curve
-        precision, recall, _ = precision_recall_curve(truths, positive.cpu().numpy())
-        average_precision = average_precision_score(truths, positive.cpu().numpy())
+        precision, recall, _ = precision_recall_curve(truths, positive)
+        average_precision = average_precision_score(truths, positive)
         fig, ax = plt.subplots(figsize=(8, 7))
         ax.plot([0, 1], [0.5, 0.5], linestyle='--', lw=2, color='r', label='Chance', alpha=.8)
         ax.plot(recall, precision, color='b', label=r'Precision-Recall curve (AP = %0.2f)' % (average_precision), lw=2, alpha=.8)
@@ -455,87 +423,19 @@ class BaseMethod:
         ax.legend(loc="lower right")
         fig.savefig(f'{self.figures_path}/TestSetPrecisionRecall.png')
         plt.close(fig)
-
-        # uncertainty metrics
-        preds = iters.softmax(dim=2)  # (N, T, C)
-        calibration_pairs = []  # tuple (y_true, y_prob) only for the positive class
-        entropy_all = []
-        variance_all = []
-        mi_all = []
-        nll_all = []
-        for i in range(preds.shape[0]):
-            tmp = preds[i].cpu().numpy()  # (T, C)
-            # entropy
-            entropy = -np.sum(np.mean(tmp, axis=0) * np.log(np.mean(tmp, axis=0) + 1e-5), axis=0)
-            entropy_all.append(entropy)
-            # variance
-            # positive = tmp[..., 1]  # (T, C) -> (T)
-            variance = tmp.var(axis=0).sum()  # (T, C) -> (C) -> (1)
-            variance_all.append(variance)
-            # mutual information
-            expected_entropy = -np.mean(np.sum(tmp * np.log(tmp + 1e-5), axis=1), axis=0)
-            mi = entropy - expected_entropy
-            mi_all.append(mi)
-            # negative log likelihood
-            y_true = np.eye(tmp.shape[-1])[truths[i]]
-            y_pred = iters[i].mean(dim=0).softmax(dim=0).cpu().numpy()  # (T, C) -> (C)
-            nll = -np.mean(np.sum(y_true * np.log(y_pred+1e-5), axis=0))
-            nll_all.append(nll)
-            # plot image with GradCAM heatmap
-            image_rgb = cv2.cvtColor(normalise(np.squeeze(images[i]), 1, 0), cv2.COLOR_GRAY2RGB)
-            fig, ax = plt.subplots(len(self.intermediate_layers)+1, 3)  #, figsize=(8, 15.5))
-            plot_pos = []
-            for x in range(len(self.intermediate_layers)+1):
-                row = []
-                for y in range(3):
-                    row.append([x, y])
-                plot_pos.append(row)
-            for k in range(len(self.intermediate_layers)+1):  # +1 for the final output
-                neg_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][k][..., 0]))
-                pos_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][k][..., 1]))
-                ax[plot_pos[k][0][0]][plot_pos[k][0][1]].imshow(image_rgb)
-                gt = 'Positive' if truths[i] == 1 else 'Negative'
-                y_pred_head = iters[i][k].softmax(dim=0).cpu().numpy()  # (T, C) -> (C)
-                ax[plot_pos[k][0][0]][plot_pos[k][0][1]].set_title(f'Original image\n{gt}')
-                ax[plot_pos[k][1][0]][plot_pos[k][1][1]].imshow(neg_cam_image)
-                ax[plot_pos[k][1][0]][plot_pos[k][1][1]].set_title(f'Negative GradCAM\nPredicted Prob {y_pred_head[0]:.2f}')
-                ax[plot_pos[k][2][0]][plot_pos[k][2][1]].imshow(pos_cam_image)
-                ax[plot_pos[k][2][0]][plot_pos[k][2][1]].set_title(f'Positive GradCAM\nPredicted Prob {y_pred_head[1]:.2f}')
-                for a in ax[k]:
-                    a.axis('off')
-            fig.suptitle(f'true: {truths[i]} | pred: {y_pred.argmax()} | ent:{entropy:.2f} | var:{variance:.2f} | mi:{mi:.2f} | nll:{nll:.2f}')
-            fig.tight_layout()
-            plt.savefig(f'{self.metrics_out_path}/{i+1}.png', bbox_inches='tight')
-            plt.close(fig)
-            # neg_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][..., 0]))
-            # pos_cam_image = show_cam_on_image(image_rgb, np.squeeze(cam_hmaps[i][..., 1]))
-            # fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-            # ax[0].imshow(image_rgb)
-            # gt = 'Positive' if truths[i] == 1 else 'Negative'
-            # ax[0].set_title(f'Original image | {gt}')
-            # ax[1].imshow(neg_cam_image)
-            # ax[1].set_title(f'Negative GradCAM | Predicted Prob {y_pred[0]:.2f}')
-            # ax[2].imshow(pos_cam_image)
-            # ax[2].set_title(f'Positive GradCAM | Predicted Prob {y_pred[1]:.2f}')
-            # for a in ax:
-            #     a.axis('off')
-            # plt.suptitle(f'true: {truths[i]} | pred: {y_pred.argmax()} | ent:{entropy:.2f} | var:{variance:.2f} | mi:{mi:.2f} | nll:{nll:.2f}')
-            # plt.savefig(f'{self.metrics_out_path}/{i+1}.png', bbox_inches='tight')
-            # plt.close(fig)
         
-        preds = iters.mean(dim=1).softmax(dim=1).cpu().numpy()  # (N, T, C) -> (N, C)
         results = dict()
         results['truth'] = truths
         results['prediction'] = preds.argmax(axis=1)
         results['negative_prob'] = preds[:, 0]
         results['positive_prob'] = preds[:, 1]
-        results['nll'] = nll_all
-        results['entropy'] = entropy_all
-        results['variance'] = variance_all
-        results['mi'] = mi_all
+        # TODO move all the metric calculations to a separate function
+        # results['nll'] = nll_all
+        # results['entropy'] = entropy_all
+        # results['variance'] = variance_all
+        # results['mi'] = mi_all
         df = pd.DataFrame(results)
         df.to_csv(str(self.metrics_out_path / self.results_csv_file))
-
 
     def run_test_passes_segmentation(self, loader):
         self.model.eval()

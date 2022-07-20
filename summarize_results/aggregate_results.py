@@ -10,7 +10,7 @@ from sklearn.calibration import calibration_curve
 import itertools
 sns.set_theme(style='whitegrid')
 
-sys.path.append('/home/kaisar/EuCanImage/Coding/UQComparison/new-uncertainty-estimation-method')
+sys.path.append('/home/kaisar/EuCanImage/Coding/LayerEnsembles')
 import configs
 from utils import make_folders
 from exp_list import get_experiments_list
@@ -85,9 +85,13 @@ for method, exp_name in experiments.items():
     print('METHOD', method)
     print(exp_name)
     methods.append(method)
-    models_path, figures_path, seg_out_path = make_folders(configs.RESULTS_PATH, exp_name)
+    models_path, figures_path, metrics_out_path = make_folders(configs.RESULTS_PATH, exp_name)
     figures_save_path = figures_path
-    df = pd.read_csv(f'{seg_out_path}/results_{exp_name}.csv')
+    df = pd.read_csv(f'{metrics_out_path}/results_{exp_name}.csv')
+    col_names = df.columns.tolist()
+    # get number of classes
+    num_classes = len([col for col in col_names if col.startswith('dsc')])
+
     df.rename(columns={'dsc_norm': 'DSC', 'mhd': 'MHD', 'nll': 'NLL', 'avg_variance': 'Variance', 'avg_entropy': 'Entropy', 'avg_mi': 'MI', 'aula': 'AULA'}, inplace=True)
     # check if multi-class
     cols = df.columns.tolist()
@@ -479,10 +483,10 @@ else:
 # }
 # for i, (method, exp_name) in enumerate(experiments.items()):
 #     methods.append(method)
-#     models_path, figures_path, seg_out_path = make_folders(configs.RESULTS_PATH, exp_name)
+#     models_path, figures_path, metrics_out_path = make_folders(configs.RESULTS_PATH, exp_name)
 #     print(method)
 #     pd_path = f'results_{exp_name}-prediction_depth_all.pkl'
-#     pickled_prediction_depths = pickle.load( open(str(seg_out_path / pd_path), "rb"))  # (N, T)
+#     pickled_prediction_depths = pickle.load( open(str(metrics_out_path / pd_path), "rb"))  # (N, T)
 #     # calculate prediction depth for each sample in prediction_depth_all NOTE this threshold is hardcoded
 #     prediction_depths = [get_prediction_depth(agreement, 0.95) for agreement in pickled_prediction_depths]
 #     # calculate the histogram
@@ -517,13 +521,13 @@ else:
 #         ax.plot([0, 1], [0, 1], 'k--')
 #         for method, exp_name in experiments.items():
 #             methods.append(method)
-#             models_path, figures_path, seg_out_path = make_folders(configs.RESULTS_PATH, exp_name)
+#             models_path, figures_path, metrics_out_path = make_folders(configs.RESULTS_PATH, exp_name)
 #             print(method)
 #             y_true[method] = []
 #             y_prob[method] = []
 #             probas_path = f'results_{exp_name}-calibration_pairs.pkl'
 #             # calibration pairs is a list of tuples of (lbl, probs)
-#             calibration_pairs = pickle.load( open(str(seg_out_path / probas_path), "rb"))
+#             calibration_pairs = pickle.load( open(str(metrics_out_path / probas_path), "rb"))
 #             y_true[method].extend([a[0] for a in calibration_pairs])
 #             y_prob[method].extend([a[1] for a in calibration_pairs])
 #             yt = list(itertools.chain.from_iterable([x.flatten() for x in y_true[method]]))

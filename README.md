@@ -13,7 +13,7 @@
 
 ## Description
 
-&#128221; **The source code is still being migrated from a private repository.**
+&#128679; **The source code is still being migrated from a private repository.**
 
 ### Method
 
@@ -96,7 +96,7 @@ In the results below, you can see that AULA correlates well with the segmentatio
         print(layer, out.shape)
     ```
 
-6. Training goes as usual, but note that the ```outputs``` is a list of tensors corresponding for each output head. Thus, we calculate the ```total_loss``` as the sum of each output heads and then backpropagate.
+6. Training goes as usual, but note that the ```outputs``` is a dictionary with tensor values corresponding for each output head name as keys. Thus, we calculate the ```total_loss``` as the sum of each output heads and then backpropagate.
 
     ```python
     model.train()

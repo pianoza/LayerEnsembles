@@ -42,7 +42,7 @@ class ClassificationHead(nn.Sequential):
         pool = nn.AdaptiveAvgPool2d(1) if pooling == 'avg' else nn.AdaptiveMaxPool2d(1)
         flatten = nn.Flatten()
         dropout = nn.Dropout(p=dropout, inplace=True) if dropout else nn.Identity()
-        linear = nn.Linear(64, classes, bias=True)  # 32 was `in_channels`
+        linear = nn.Linear(in_channels, classes, bias=True)  # 32 was `in_channels`
         activation = Activation(activation)
         # super().__init__(conv1, relu1, bn1, conv2, relu2, bn2, pool, flatten, dropout, linear, activation)
         super().__init__(pool, flatten, dropout, linear, activation)
